@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	simplejson "github.com/bitly/go-simplejson"
-	jsoniter "github.com/json-iterator/go"
 	jmespath "github.com/jmespath/go-jmespath"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	"io"
 )
@@ -39,6 +39,9 @@ type fdResult struct {
 	suggestion []string
 	candidates []string
 	err        error
+	// node is the lossless result tree. Plain navigation reuses parsed
+	// nodes (span-traceable); JMESPath-only results are synthetic.
+	node *Node
 }
 
 type evalEntry struct {
@@ -54,15 +57,23 @@ type JsonManager struct {
 	current    *simplejson.Json
 	origin     *simplejson.Json
 	originData interface{}
+	// tree is the lossless unified syntax tree of the original document
+	// (token spans, number lexemes, ordered members with duplicates kept).
+	tree *Node
+	// mode selects lossless / canonical / standard output rendering.
+	mode OutputStrategy
+	// lastDiag holds precision/duplicate-key diagnostics for lastFD.
+	lastDiag   Diagnostics
 	suggestion *Suggestion
 	// Single-entry memo for GetFilteredData/GetPretty. The TUI calls them
 	// once per frame with an unchanged query while scrolling or cycling
 	// candidates. Single-goroutine access only (termbox event loop).
-	lastFDKey     fdKey
-	lastFD        *fdResult // nil = no cached entry
-	lastPretty    string    // MarshalIndent output for lastFDKey
-	lastPrettyErr error
-	lastPrettyOK  bool
+	lastFDKey      fdKey
+	lastFD         *fdResult // nil = no cached entry
+	lastPretty     string    // MarshalIndent output for lastFDKey
+	lastPrettyErr  error
+	lastPrettyOK   bool
+	lastPrettyMode OutputStrategy // strategy lastPretty was rendered with
 	// evalCache memoizes evalJMESPath results: one keystroke can evaluate
 	// the same expression several times (base expr, rewrites, suggestions).
 	// Scoped to a single GetFilteredData computation — cleared on every
@@ -89,18 +100,66 @@ func NewJsonManager(reader io.Reader) (*JsonManager, error) {
 		return nil, errors.Wrap(err3, "invalid json format")
 	}
 
+	// Lossless syntax tree (spans, number lexemes, ordered duplicate keys).
+	tree, err4 := ParseDocument(string(buf))
+	if err4 != nil {
+		return nil, errors.Wrap(err4, "invalid json format")
+	}
+
 	jm := &JsonManager{
 		origin:     j,
 		current:    j,
 		originData: originData,
+		tree:       tree,
+		mode:       StrategyLossless,
 		suggestion: NewSuggestion(),
 	}
 
 	return jm, nil
 }
 
+// SetOutputStrategy changes the output rendering strategy (lossless /
+// canonical / standard).
+func (jm *JsonManager) SetOutputStrategy(mode OutputStrategy) {
+	jm.mode = mode
+}
+
+// OutputStrategy returns the active output rendering strategy.
+func (jm *JsonManager) OutputStrategy() OutputStrategy {
+	return jm.mode
+}
+
+// Tree returns the parsed lossless document tree.
+func (jm *JsonManager) Tree() *Node {
+	return jm.tree
+}
+
+// LastDiagnostics returns precision/duplicate-key diagnostics collected for
+// the most recent GetFilteredData result.
+func (jm *JsonManager) LastDiagnostics() Diagnostics {
+	return jm.lastDiag
+}
+
+// LastResultNode returns the lossless tree node backing the most recent
+// GetFilteredData result, or nil when nothing has been queried yet.
+func (jm *JsonManager) LastResultNode() *Node {
+	if jm.lastFD == nil {
+		return nil
+	}
+	return jm.lastFD.node
+}
+
 func (jm *JsonManager) Get(q QueryInterface, confirm bool) (string, []string, []string, error) {
 	j, suggestion, candidates, _ := jm.GetFilteredData(q, confirm)
+
+	if jm.lastFD != nil && jm.lastFD.node != nil {
+		s, err := RenderNode(jm.lastFD.node, jm.mode, false)
+		if err != nil {
+			// DuplicateKeyError etc.: surface unchanged.
+			return "", suggestion, candidates, err
+		}
+		return s, suggestion, candidates, nil
+	}
 
 	data, enc_err := fastjson.Marshal(j.Interface())
 	if enc_err != nil {
@@ -112,25 +171,32 @@ func (jm *JsonManager) Get(q QueryInterface, confirm bool) (string, []string, []
 
 func (jm *JsonManager) GetPretty(q QueryInterface, confirm bool) (string, []string, []string, error) {
 	key := fdKey{q.StringGet(), confirm}
-	j, suggestion, candidates, _ := jm.GetFilteredData(q, confirm)
-	if jm.lastPrettyOK && jm.lastFDKey == key {
+	_, suggestion, candidates, _ := jm.GetFilteredData(q, confirm)
+	if jm.lastPrettyOK && jm.lastFDKey == key && jm.lastPrettyMode == jm.mode {
 		if jm.lastPrettyErr != nil {
 			return "", []string{"", ""}, []string{"", ""}, jm.lastPrettyErr
 		}
 		return jm.lastPretty, suggestion, candidates, nil
 	}
-	s, err := fastjson.MarshalIndent(j.Interface(), "", "  ")
+	var s string
+	var err error
+	if jm.lastFD != nil && jm.lastFD.node != nil {
+		s, err = RenderNode(jm.lastFD.node, jm.mode, true)
+	} else {
+		var b []byte
+		b, err = fastjson.MarshalIndent(jm.lastFD.json.Interface(), "", "  ")
+		s = string(b)
+	}
 	if err != nil {
-		wrapped := errors.Wrap(err, "failure json encode")
 		if jm.lastFD != nil && jm.lastFDKey == key {
-			jm.lastPretty, jm.lastPrettyErr, jm.lastPrettyOK = "", wrapped, true
+			jm.lastPretty, jm.lastPrettyErr, jm.lastPrettyOK, jm.lastPrettyMode = "", err, true, jm.mode
 		}
-		return "", []string{"", ""}, []string{"", ""}, wrapped
+		return "", []string{"", ""}, []string{"", ""}, err
 	}
 	if jm.lastFD != nil && jm.lastFDKey == key {
-		jm.lastPretty, jm.lastPrettyErr, jm.lastPrettyOK = string(s), nil, true
+		jm.lastPretty, jm.lastPrettyErr, jm.lastPrettyOK, jm.lastPrettyMode = s, nil, true, jm.mode
 	}
-	return string(s), suggestion, candidates, nil
+	return s, suggestion, candidates, nil
 }
 
 // isJMESPathQuery returns true when the query contains JMESPath-specific syntax
@@ -285,13 +351,15 @@ func pipeSuffix(qs string) string {
 	return ""
 }
 
-
 func (jm *JsonManager) GetFilteredData(q QueryInterface, confirm bool) (*simplejson.Json, []string, []string, error) {
 	qs := q.StringGet()
 
 	key := fdKey{qs, confirm}
 	if jm.lastFD != nil && jm.lastFDKey == key {
 		r := jm.lastFD
+		// The strategy can change between frames; recompute diagnostics
+		// even when the filtered result itself is cached.
+		jm.lastDiag = CollectDiagnostics(r.node, jm.mode)
 		return r.json, r.suggestion, r.candidates, r.err
 	}
 
@@ -303,11 +371,38 @@ func (jm *JsonManager) GetFilteredData(q QueryInterface, confirm bool) (*simplej
 	var r fdResult
 	if isJMESPathQuery(qs) {
 		r.json, r.suggestion, r.candidates, r.err = jm.getFilteredDataJMESPath(qs, confirm)
+		// Prefer a span-traceable tree result when the expression is plain
+		// navigation; verify it matches the simplejson view exactly so the
+		// suggestion fallbacks (typing modes, wildcard rewrites) stay
+		// authoritative. Otherwise wrap the JMESPath output synthetically.
+		r.node = jm.resolveResultNode(jmespathExprFromQuery(qs), r.json)
 	} else {
-		r.json, r.suggestion, r.candidates, r.err = jm.getFilteredDataLegacy(q, confirm)
+		r.json, r.suggestion, r.candidates, r.err, r.node = jm.getFilteredDataLegacy(q, confirm)
 	}
+	jm.lastDiag = CollectDiagnostics(r.node, jm.mode)
 	jm.lastFDKey, jm.lastFD, jm.lastPrettyOK = key, &r, false
 	return r.json, r.suggestion, r.candidates, r.err
+}
+
+// resolveResultNode picks the lossless node backing a JMESPath result. It
+// uses a referenced tree node only when (a) the expression belongs to the
+// span-preserving navigation subset and (b) its canonical rendering equals
+// what go-jmespath produced for the displayed simplejson view.
+func (jm *JsonManager) resolveResultNode(expr string, sj *simplejson.Json) *Node {
+	// A failed JMESPath evaluation yields no view; represent it as null
+	// instead of dereferencing a nil simplejson result.
+	if sj == nil {
+		return syntheticNull()
+	}
+	if n, ok := evalPathOnTree(expr, jm.tree); ok {
+		treeView, terr := marshalJSON(canonicalValue(n), false)
+		if terr == nil {
+			if b, jerr := fastjson.Marshal(sj.Interface()); jerr == nil && treeView == string(b) {
+				return n
+			}
+		}
+	}
+	return nodeFromInterface(sj.Interface())
 }
 
 // isFunctionTypingMode returns true when the user appears to be mid-typing a
@@ -588,21 +683,26 @@ func (jm *JsonManager) getFilteredDataJMESPath(qs string, confirm bool) (*simple
 	return jm.origin, []string{"", ""}, []string{}, nil
 }
 
-// getFilteredDataLegacy is the original keyword-traversal logic, unchanged.
-func (jm *JsonManager) getFilteredDataLegacy(q QueryInterface, confirm bool) (*simplejson.Json, []string, []string, error) {
+// getFilteredDataLegacy is the original keyword-traversal logic, unchanged
+// in its simplejson behaviour. The returned *Node tracks the same traversal
+// on the lossless tree so the result keeps its source span; missing steps
+// map to synthetic null nodes.
+func (jm *JsonManager) getFilteredDataLegacy(q QueryInterface, confirm bool) (*simplejson.Json, []string, []string, error, *Node) {
 	json := jm.origin
+	node := jm.tree
 
 	lastKeyword := q.StringGetLastKeyword()
 	keywords := q.StringGetKeywords()
 
 	idx := 0
 	if l := len(keywords); l == 0 {
-		return json, []string{"", ""}, []string{}, nil
+		return json, []string{"", ""}, []string{}, nil, node
 	} else if l > 0 {
 		idx = l - 1
 	}
 	for _, keyword := range keywords[0:idx] {
 		json, _ = getItem(json, keyword)
+		node = nodeStep(node, keyword)
 	}
 	suggest := jm.suggestion.Get(json, lastKeyword)
 	candidateKeys := jm.suggestion.GetCandidateKeys(json, lastKeyword)
@@ -611,6 +711,7 @@ func (jm *JsonManager) getFilteredDataLegacy(q QueryInterface, confirm bool) (*s
 		candidateNum := len(candidateKeys)
 		if j, exist := getItem(json, lastKeyword); exist && (confirm || candidateNum == 1) {
 			json = j
+			node = nodeStep(node, lastKeyword)
 			candidateKeys = []string{}
 			if _, err := json.Array(); err == nil {
 				suggest = jm.suggestion.Get(json, "")
@@ -618,11 +719,15 @@ func (jm *JsonManager) getFilteredDataLegacy(q QueryInterface, confirm bool) (*s
 				suggest = []string{"", ""}
 			}
 		} else if candidateNum < 1 {
+			// j is the getItem result regardless of the confirm condition
+			// (an out-of-range/missing value encodes as null); nodeStep
+			// mirrors that with the referenced node or a synthetic null.
 			json = j
+			node = nodeStep(node, lastKeyword)
 			suggest = jm.suggestion.Get(json, "")
 		}
 	}
-	return json, suggest, candidateKeys, nil
+	return json, suggest, candidateKeys, nil, node
 }
 
 func (jm *JsonManager) GetCandidateKeys(q QueryInterface) []string {

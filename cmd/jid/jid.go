@@ -18,6 +18,7 @@ func main() {
 	var version bool
 	var mono bool
 	var pretty bool
+	var outputMode string
 	qs := "."
 
 	flag.BoolVar(&qm, "q", false, "Output query mode")
@@ -26,6 +27,8 @@ func main() {
 	flag.BoolVar(&version, "version", false, "print the version and exit")
 	flag.BoolVar(&mono, "M", false, "monochrome output mode")
 	flag.BoolVar(&pretty, "p", false, "pretty print json result")
+	flag.StringVar(&outputMode, "s", "", "output strategy: lossless (default), canonical, standard")
+	flag.StringVar(&outputMode, "output", "", "output strategy: lossless (default), canonical, standard")
 	flag.Parse()
 
 	if help {
@@ -47,6 +50,7 @@ func main() {
 		DefaultQuery: qs,
 		Monochrome:   mono,
 		PrettyResult: pretty,
+		OutputMode:   outputMode,
 	}
 
 	e, err := jid.NewEngine(content, ea)
@@ -154,6 +158,23 @@ Down Arrow
 . | keys(@)                pipe + function: list root keys
 .users | sort_by(@, &name) sort array of objects by field
 .users | length(@)         pipe + function: count elements
+
+============ Output strategies (-s / --output) =============
+
+lossless (default)
+  Preserve the original number lexemes (integers > 2^53 and high-precision
+  decimals round-trip unchanged) and keep every duplicate key in order.
+
+canonical
+  Standard encoding/json rendering: keys sorted, duplicate keys collapse
+  (last wins), numbers interpreted as float64 (may lose precision).
+
+standard
+  Like canonical, but refuse to output any object containing duplicate
+  keys (error with the key location).
+
+The strategy can also be set with behavior.output_mode in config.toml.
+The status bar reports precision loss and duplicate-key diagnostics.
 
 `
 }

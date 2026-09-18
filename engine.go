@@ -1,6 +1,7 @@
 package jid
 
 import (
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -59,19 +60,37 @@ type Engine struct {
 	contentsRaw string
 	// quit requested via quit keybinding
 	quitRequested bool
+	// status line diagnostics (precision / duplicate keys) for the terminal
+	statusLine  string
+	statusAlert bool
 }
 
 type EngineAttribute struct {
 	DefaultQuery string
 	Monochrome   bool
 	PrettyResult bool
+	// OutputMode selects the JSON output strategy: "lossless" (default),
+	// "canonical" or "standard" (reject duplicate keys). Empty means the
+	// config file value, falling back to lossless.
+	OutputMode string
 }
 
 func NewEngine(s io.Reader, ea *EngineAttribute) (EngineInterface, error) {
+	cfg := LoadConfig()
+	modeName := ea.OutputMode
+	if modeName == "" {
+		modeName = cfg.Behavior.OutputMode
+	}
+	mode, err := ParseOutputStrategy(modeName)
+	if err != nil {
+		return nil, err
+	}
+
 	j, err := NewJsonManager(s)
 	if err != nil {
 		return nil, err
 	}
+	j.SetOutputStrategy(mode)
 	e := &Engine{
 		manager:       j,
 		term:          NewTerminal(FilterPrompt, DefaultY, ea.Monochrome),
@@ -86,7 +105,7 @@ func NewEngine(s io.Reader, ea *EngineAttribute) (EngineInterface, error) {
 		prettyResult:     ea.PrettyResult,
 		showFuncHelp:     true,
 		placeholderStart: -1,
-		cfg:              LoadConfig(),
+		cfg:              cfg,
 	}
 	e.history = NewHistory(e.cfg.HistoryPath(), e.cfg.History.MaxSize)
 	e.queryCursorIdx = e.query.Length()
@@ -161,7 +180,8 @@ func (e *Engine) Run() EngineResultInterface {
 					// Auto-scroll so the highlighted key is visible when Tab/Shift+Tab was pressed.
 					if e.candidateScrollNeeded {
 						_, h := termbox.Size()
-						visibleEnd := e.contentOffset + h - DefaultY
+						// Reserve the bottom row for the diagnostics status line.
+						visibleEnd := e.contentOffset + h - DefaultY - 1
 						if foundLine < e.contentOffset || foundLine >= visibleEnd {
 							e.contentOffset = foundLine
 						}
@@ -178,7 +198,8 @@ func (e *Engine) Run() EngineResultInterface {
 				selectedCandidate = keyName
 				selectedCandidateIndent = foundIndent
 				_, h := termbox.Size()
-				visibleEnd := e.contentOffset + h - DefaultY
+				// Reserve the bottom row for the diagnostics status line.
+				visibleEnd := e.contentOffset + h - DefaultY - 1
 				if foundLine < e.contentOffset || foundLine >= visibleEnd {
 					e.contentOffset = foundLine
 				}
@@ -202,6 +223,8 @@ func (e *Engine) Run() EngineResultInterface {
 			PlaceholderLen:         e.placeholderLen,
 			SelectedCandidate:      selectedCandidate,
 			SelectedCandidateIndent: selectedCandidateIndent,
+			StatusLine:             e.statusLine,
+			StatusAlert:            e.statusAlert,
 		}
 		err = e.term.Draw(ta)
 		if err != nil {
@@ -311,12 +334,42 @@ func (e *Engine) getContents() []string {
 		// filtered JSON (its output was discarded here anyway).
 		_, e.complete, e.candidates, _ = e.manager.GetFilteredData(e.query, e.queryConfirm)
 		e.contentsRaw = ""
+		e.updateStatusLine()
 		return e.candidates
 	}
 	var c string
 	c, e.complete, e.candidates, _ = e.manager.GetPretty(e.query, e.queryConfirm)
 	e.contentsRaw = c
+	e.updateStatusLine()
+	// "standard" strategy refuses to render duplicate-key objects: show the
+	// reason in the content area instead of an empty screen.
+	if e.statusAlert && e.manager.LastDiagnostics().HasDuplicates() {
+		c = e.duplicateRejectionNotice(e.manager.LastDiagnostics())
+		e.contentsRaw = c
+	}
 	return strings.Split(c, "\n")
+}
+
+// updateStatusLine refreshes the precision / duplicate-key status line from
+// the latest filter result.
+func (e *Engine) updateStatusLine() {
+	e.statusLine, e.statusAlert = e.manager.LastDiagnostics().StatusLine()
+}
+
+// duplicateRejectionNotice builds the content-area explanation shown under
+// the "standard" strategy when a selected subtree has duplicate keys.
+func (e *Engine) duplicateRejectionNotice(d Diagnostics) string {
+	g := d.DupGroups[0]
+	var b strings.Builder
+	b.WriteString("Output strategy \"standard\" rejects duplicate keys.\n\n")
+	fmt.Fprintf(&b, "  key %q appears %d times in the selected object\n", g.Key, g.Count)
+	fmt.Fprintf(&b, "  first repeated occurrence: line %d, column %d, byte offset %d\n\n",
+		g.Span.Line, g.Span.Col, g.Span.ByteStart)
+	b.WriteString("Switch the output strategy to render this result:\n")
+	b.WriteString("  lossless  — keep every occurrence in document order\n")
+	b.WriteString("  canonical — collapse duplicates (last wins)\n\n")
+	b.WriteString("Configure with -s/--output or behavior.output_mode in config.toml.")
+	return b.String()
 }
 
 func (e *Engine) setCandidateData() {

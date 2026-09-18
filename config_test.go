@@ -76,6 +76,27 @@ scroll_down = "ctrl+d"
 	assert.Equal(t, historyMaxSize, cfg.History.MaxSize)
 }
 
+func TestLoadConfigOutputMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	require.NoError(t, os.WriteFile(path, []byte(`
+[behavior]
+output_mode = "canonical"
+`), 0644))
+
+	cfg := loadConfigFromPath(path)
+	assert.Equal(t, "canonical", cfg.Behavior.OutputMode)
+
+	// The stored value must be a usable strategy name.
+	mode, err := ParseOutputStrategy(cfg.Behavior.OutputMode)
+	require.NoError(t, err)
+	assert.Equal(t, StrategyCanonical, mode)
+
+	// Default stays empty (resolved to lossless by the engine).
+	assert.Equal(t, "", defaultConfig().Behavior.OutputMode)
+}
+
 func TestLoadConfigInvalidTOML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

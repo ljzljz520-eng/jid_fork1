@@ -20,6 +20,9 @@ type BehaviorConfig struct {
 	// ExitOnEnter controls whether Enter exits jid (default: true for backwards compatibility).
 	// Set to false to make Enter only confirm a candidate; use the quit keybinding to exit.
 	ExitOnEnter *bool `toml:"exit_on_enter"`
+	// OutputMode selects the JSON output strategy: "lossless" (default),
+	// "canonical" or "standard" (reject duplicate keys).
+	OutputMode string `toml:"output_mode"`
 }
 
 // IsExitOnEnter returns true when Enter should exit jid (the default).
@@ -140,6 +143,9 @@ func loadConfigFromPath(path string) Config {
 	mergeKeybindings(&cfg.Keybindings, fileCfg.Keybindings)
 	if fileCfg.Behavior.ExitOnEnter != nil {
 		cfg.Behavior.ExitOnEnter = fileCfg.Behavior.ExitOnEnter
+	}
+	if fileCfg.Behavior.OutputMode != "" {
+		cfg.Behavior.OutputMode = fileCfg.Behavior.OutputMode
 	}
 	return cfg
 }

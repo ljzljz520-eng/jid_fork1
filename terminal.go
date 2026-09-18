@@ -42,6 +42,10 @@ type TerminalDrawAttributes struct {
 	PlaceholderLen          int
 	SelectedCandidate       string // field name to highlight in JSON; "" if none
 	SelectedCandidateIndent int    // indentation level of the target key
+	// StatusLine is shown on the bottom row: precision-loss and
+	// duplicate-key diagnostics for the current result.
+	StatusLine  string
+	StatusAlert bool // render the status line in red for hard errors
 }
 
 func NewTerminal(prompt string, defaultY int, monochrome bool) *Terminal {
@@ -70,7 +74,12 @@ func (t *Terminal) Draw(attr *TerminalDrawAttributes) error {
 	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 
 	y := t.defaultY
-	_, h := termbox.Size()
+	w, h := termbox.Size()
+	// Reserve the bottom row for the diagnostics status line.
+	statusRows := 0
+	if attr.StatusLine != "" {
+		statusRows = 1
+	}
 
 	t.drawFilterLine(query, complete, attr.PlaceholderStart, attr.PlaceholderLen)
 
@@ -102,15 +111,42 @@ func (t *Terminal) Draw(attr *TerminalDrawAttributes) error {
 		if i >= 0 {
 			t.drawCells(0, i+y, cells)
 		}
-		if i > h {
+		// Stop before the reserved status-line row.
+		if i+y >= h-statusRows {
 			break
 		}
+	}
+
+	if statusRows == 1 {
+		t.drawStatusLine(h-1, w, attr.StatusLine, attr.StatusAlert)
 	}
 
 	termbox.SetCursor(len(t.prompt)+attr.CursorOffset, 0)
 
 	termbox.Flush()
 	return nil
+}
+
+// drawStatusLine renders the diagnostics summary on the bottom terminal row,
+// truncating it to the terminal width.
+func (t *Terminal) drawStatusLine(y, width int, text string, alert bool) {
+	color := termbox.ColorCyan
+	if alert {
+		color = termbox.ColorRed | termbox.AttrBold
+	}
+	runes := []rune(text)
+	if len(runes) > width {
+		runes = append(runes[:width-1], '…')
+	}
+	col := 0
+	for _, ch := range runes {
+		termbox.SetCell(col, y, ch, color, termbox.ColorDefault)
+		cw := runewidth.RuneWidth(ch)
+		if cw == 0 || cw == 2 && runewidth.IsAmbiguousWidth(ch) {
+			cw = 1
+		}
+		col += cw
+	}
 }
 
 func (t *Terminal) drawFilterLine(qs string, complete string, phStart int, phLen int) error {

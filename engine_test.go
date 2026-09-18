@@ -163,7 +163,9 @@ func TestGetContents(t *testing.T) {
 	e = getEngine(`{"name":"go", "naming":"simeji", "foo":"bar"}`, "")
 	e.query.StringSet(".n")
 	c = e.getContents()
-	assert.Equal([]string{`{`, `  "foo": "bar",`, `  "name": "go",`, `  "naming": "simeji"`, "}"}, c)
+	// Lossless strategy preserves source key order (name, naming, foo)
+	// instead of the alphabetical order map encoding produced before.
+	assert.Equal([]string{`{`, `  "name": "go",`, `  "naming": "simeji",`, `  "foo": "bar"`, "}"}, c)
 	assert.Equal([]string{"name", "naming"}, e.candidates)
 	assert.Equal([]string{"am", "nam"}, e.complete)
 

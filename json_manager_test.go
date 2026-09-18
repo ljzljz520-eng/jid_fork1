@@ -19,12 +19,15 @@ func TestNewJson(t *testing.T) {
 	buf, _ := io.ReadAll(rr)
 	sj, _ := simplejson.NewJson(buf)
 
-	assert.Equal(jm, &JsonManager{
-		current:    sj,
-		origin:     sj,
-		originData: map[string]interface{}{"name": "go"},
-		suggestion: NewSuggestion(),
-	})
+	// The manager now also owns a lossless syntax tree and an output
+	// strategy; assert the established fields rather than the full struct.
+	assert.Equal(sj, jm.current)
+	assert.Equal(sj, jm.origin)
+	assert.Equal(map[string]interface{}{"name": "go"}, jm.originData)
+	assert.Equal(NewSuggestion(), jm.suggestion)
+	assert.NotNil(jm.tree)
+	assert.Equal(StrategyLossless, jm.mode)
+	assert.Equal(`{"name":"go"}`, jm.tree.doc.src)
 	assert.Nil(e)
 
 	assert.Equal("go", jm.current.Get("name").MustString())
